@@ -10,4 +10,3 @@
 - **LLM-based persona pipeline**:
   - *Persona retrieval*: a fine-tuned retrieval LLM that assigns personas to users from the extended taxonomy.
   - *Persona discovery*: discovering personas not in the existing taxonomy.
-## Repository Structure
