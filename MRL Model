@@ -1,0 +1,150 @@
+class GATPolicy(BaseModel):
+
+    def __init__(self):
+        super(GATPolicy, self).__init__()
+
+        self.emb_size = 768
+        self.user_nfeats = 1879
+        self.prod_nfeats = 1879
+        self.pers_nfeats = 1879
+        # self.cons_nfeats = 5
+        self.edge_nfeats = 8
+        # self.var_nfeats = 19
+        
+        # print('self.emb_size',self.emb_size)
+
+        self.activation = nn.ReLU()
+        self.initializer = lambda x: torch.nn.init.orthogonal_(x, gain=1)
+        self.dict_norm_task = None
+
+        self.edge_embedding = nn.Sequential(nn.Linear(self.edge_nfeats, self.emb_size, bias=True),)
+        self.user_embedding = nn.Sequential(nn.Linear(self.user_nfeats, self.emb_size, bias=True),)
+        self.prod_embedding = nn.Sequential(nn.Linear(self.prod_nfeats, self.emb_size, bias=True),)
+        self.pers_embedding = nn.Sequential(nn.Linear(self.pers_nfeats, self.emb_size, bias=True),)
+
+        # GRAPH CONVOLUTIONS
+        # there are 2 convolutions  2 GATs (l to r)  &  (r to l)
+        self.conv_v_to_c = GATNet(self.emb_size, self.emb_size, self.emb_size, activation = self.activation)#, right_to_left=True)
+        self.conv_c_to_v = GATNet(self.emb_size, self.emb_size, self.emb_size, activation = self.activation)
+        #product to persona
+        self.conv_pro_to_per = GATNet(self.emb_size, self.emb_size, self.emb_size, activation = self.activation)
+       
+        self.initialize_parameters()
+        # MRL Setup: Create separate dynamic MLP pathways for each prefix size
+        self.prefix_sizes = [64, 128, 256, 512, 768]
+        self.mlps = nn.ModuleDict()
+        
+        for p in self.prefix_sizes:
+            in_dim = p * 2  # Concatenating U_p and P_p
+            layers = []
+            current_dim = in_dim
+            
+            # Progressively halve the dimension down to 64
+            while current_dim > 64:
+                next_dim = max(current_dim // 2, 64)
+                
+                layers.append(nn.Linear(current_dim, next_dim))
+                layers.append(nn.BatchNorm1d(next_dim))
+                layers.append(nn.ReLU())
+                layers.append(nn.Dropout(0.5))
+                
+                current_dim = next_dim
+                
+            # Final prediction layer from 64 to 1
+            layers.append(nn.Linear(64, 1))
+            layers.append(nn.Sigmoid())
+            
+            self.mlps[str(p)] = nn.Sequential(*layers)
+    
+
+    @staticmethod
+    def pad_output(output, n_vars_per_sample, pad_value=-1e8):
+        n_vars_max = torch.max(n_vars_per_sample)
+
+        output = torch.split(tensor=output,split_size_or_sections=n_vars_per_sample.tolist(),dim=1,)
+
+        output = torch.cat([F.pad(x,pad=[0, n_vars_max - x.shape[1], 0, 0],mode='constant',value=pad_value)for x in output], dim=0)
+
+        return output
+    
+    def cartesian_product(self, A, B):
+        """
+        Computes the Cartesian product of two matrices.
+
+        Args:
+        A: A matrix of shape (m, n).
+        B: A matrix of shape (p, n).
+
+        Returns:
+        A matrix of shape (m * p, 2 * n) representing the Cartesian product.
+        """
+
+        # Repeat each row of A 'p' times (number of rows in B)
+        repeated_B = B.repeat(A.shape[0], 1)
+
+        # Tile B 'm' times (number of rows in A)
+        tiled_A = A.repeat_interleave(B.shape[0], dim=0)
+
+        # Concatenate the repeated A and tiled B matrices
+        C = torch.cat((repeated_B, tiled_A), dim=1)
+
+        return C
+        
+
+    def forward(self, inputs, return_attention_weights=None):   
+
+        user_features, edge_indices, edge_features, product_features, persona_features, persona_prod_edge_ind = inputs
+        
+        min_val = edge_indices[0].min()
+        # ###pdb.set_trace()trace()                         #gat always takes the graph with all the edgeindex starting from 0 ordere irrepsecitve of the ordera and the index they have in the graph
+                                                # thus the subtraction of the m
+        edge_indices[0] -= min_val
+        # edge_indices = torch.zeros(2,0).int()
+        edge_features = torch.zeros(edge_features.shape[0],768).to(device)
+        ##pdb.set_trace()trace()
+        # edge_features = self.edge_embedding(edge_features)
+
+        user_features    = self.user_embedding(user_features.float().to(device))
+        product_features = self.prod_embedding(product_features.float().to(device))
+        persona_features = self.pers_embedding(persona_features.float().to(device)) 
+
+        user_features = user_features.to(device)
+        edge_indices = edge_indices.to(device)
+        edge_features = edge_features.to(device)
+        product_features = product_features.to(device)
+        #-----------------------------------------------------------------------------------------
+        edge_indices_rev = torch.stack([edge_indices[1], edge_indices[0]], dim=0).to(device)
+        # edge_features_prod_mp = self.edge_embedding(edge_features_prod_mp)        
+
+        product_features, attention_weights = self.conv_c_to_v((user_features, edge_indices_rev, edge_features, product_features))
+        product_features = self.activation(product_features)
+        #-----------------------------------------------------------------------------------------
+        user_features, attention_weights = self.conv_v_to_c((product_features, edge_indices, edge_features, user_features))                          # here the process is reversed - the user is put on the right and prod on left
+        user_features = self.activation(user_features)
+        #------------------------------------------------------------------------------------------
+        #message passing to persona from products
+        min_val1 = persona_prod_edge_ind[1].min()
+        persona_prod_edge_ind[1] -= min_val1
+        ##pdb.set_trace()trace()
+        edge_features = torch.zeros(persona_prod_edge_ind.shape[1],768).to(device)
+
+        # updated_prod_features = product_features[persona_neighbour_prod_index]
+        persona_features, _ = self.conv_pro_to_per((product_features, persona_prod_edge_ind, edge_features, persona_features))
+        persona_features = self.activation(persona_features)
+        
+        # MRL Link Prediction Output Generation
+        predictions_dict = {}
+        # pdb.set_trace()
+        for p in self.prefix_sizes:
+            # 1. Slice prefix for User and Persona
+            u_p = user_features[:, :p]
+            pers_p = persona_features[:, :p]
+            
+            # 2. Cartesian product
+            all_pairs_p = self.cartesian_product(u_p, pers_p).to(device)
+            
+            # 3. Predict via the dedicated MLP for this prefix
+            pred_p = self.mlps[str(p)](all_pairs_p)
+            predictions_dict[str(p)] = pred_p
+
+        return predictions_dict, user_features, product_features, persona_features
