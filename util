@@ -1,0 +1,17 @@
+def swap_rows(tensor):
+  # Create a new tensor with the rows swapped
+  new_tensor = tensor.clone().to(device)
+  new_tensor[0, :] = tensor[1, :]
+  new_tensor[1, :] = tensor[0, :]
+  return new_tensor
+
+def permute_labels(labels, permutation_order):
+    
+    # Create a permutation tensor based on the desired order
+    # labels = torch.tensor(labels, dtype=torch.long)
+    permutation_tensor = torch.tensor(permutation_order, dtype=torch.long)
+
+    # Gather the labels according to the permutation tensor
+    permuted_labels = torch.gather(labels, dim=1, index=permutation_tensor.unsqueeze(0).expand(labels.shape[0], -1))
+
+    return permuted_labels
