@@ -1,0 +1,37 @@
+class GATNet(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, activation, heads=2, center_left=True,):
+        super().__init__()
+        # print('heads', heads)
+        self.conv1 = GATConv(in_channels, out_channels, heads=heads, edge_dim = out_channels, add_self_loops=False, concat=True)#, fill_value =1.0)#add_self_loops =False)
+        #self.conv1 = SAGEConv(in_channels, out_channels, )GATill_value =1.0)#add_self_loops =False)
+        self.linear_transform = nn.Linear(out_channels*heads, out_channels)
+
+        self.activation= activation
+
+        self.feature_module_final = nn.Sequential(
+            # PreNormLayer(1, shift=False),  # normalize after summation trick
+            self.activation,
+            nn.Linear(out_channels, out_channels, bias=True)
+        )
+
+        self.post_concat = torch.nn.Linear(out_channels*2, out_features=out_channels)   
+
+    def forward(self, inputs):
+        left_features, edge_index, edge_features, right_features = inputs           # actuall right featuers are getting used
+        
+        #####pdb.set_trace()trace()
+        x=(left_features,right_features)
+        x, attention_weights = self.conv1(x, edge_index, edge_attr=edge_features, return_attention_weights=True)
+        x = x.relu()
+        # ###pdb.set_trace()trace()
+        x = self.linear_transform(x)#.relu()
+        x = self.feature_module_final(x)
+        
+        
+        
+        left_features_updated = torch.cat((right_features,x), dim=-1)   
+        # left_features_updated = torch.cat((left_features,x), dim=0)
+        
+        left_features_updated=self.post_concat(left_features_updated)
+
+        return left_features_updated, attention_weights
