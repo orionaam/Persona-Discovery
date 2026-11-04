@@ -1,0 +1,151 @@
+def test_triper_mrl(args,model):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.eval()
+    
+    # optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=args.l2)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epoch, eta_min=1e-4)
+    # criterion = nn.BCELoss(reduction='mean')
+    prefix_sizes = model.prefix_sizes
+    
+    # pred_prob = pred_prob.detach()
+
+    # ---------------- LOAD DATA (same as TriPer_A) ----------------
+    ue = torch.tensor(np.load(args.data+'/Test/ue.npy'), dtype=torch.float32).to(device)
+    # ue=user_triper.detach()
+    pe = torch.tensor(np.load(args.data+'/Test/pe.npy'), dtype=torch.float32).to(device)
+    ee = torch.tensor(np.load(args.data+'/Test/ee.npy'), dtype=torch.float32).to(device)
+    pers_emb = torch.tensor(np.load(args.data+'/Test/pers_emb.npy'), dtype=torch.float32).to(device)
+    # pers_emb=persona_triper.detach()
+    labels = torch.tensor(np.load(args.data+'/Test/lab.npy'), dtype=torch.float32).to(device)
+    # labels=label_2d
+    ei_per2pro   = swap_rows(torch.tensor(np.load(args.data +'/Test/ei_pro2per.npy')[:], dtype=torch.long ).T).to(device)
+    ei_u2pro = torch.tensor(np.load(args.data+'/Test/ei_u2pro.npy'), dtype=torch.long).T.to(device)
+    ei_pro2u     = (torch.tensor(np.load(args.data +'/Test/ei_pro2u.npy',allow_pickle=True), dtype=torch.long ).T).to(device)  #y,x fornat
+    # ei_per2pro = swap_rows(torch.tensor(np.load(args.data +'/Train/ei_pro2per.npy'), dtype=torch.long).T).to(device)
+    
+    user = ue.shape[0]
+    num_persona = labels.shape[1]
+
+    pers_emb = nn.Parameter(torch.empty(num_persona, pe.shape[1])).to(device)
+    nn.init.xavier_uniform_(pers_emb)
+
+    # ----------- FIX DIMENSIONS (same as before) ----------
+    # zero_array = torch.zeros((num_persona, pe.shape[1] - pers_emb.shape[1])).to(device)
+    # pers_emb = torch.cat((pers_emb, zero_array), dim=1)
+
+    zeros_array = torch.zeros((user, pe.shape[1] - ue.shape[1])).to(device)
+    # ue = torch.cat((ue, zeros_array), dim=1)
+    ue = torch.cat((ue, zeros_array), dim=1)
+
+    comb_embedding = torch.cat((pers_emb, ue, pe), dim=0).to(device)
+    comb_embedding = comb_embedding.to(device)
+
+    # ----------- GRAPH SAMPLING ----------
+    ei_undirected_user_pro, _ = to_undirected(ei_u2pro, ee)
+    ei_undirected_user_pro_per = torch.cat((ei_pro2u, ei_u2pro), axis = 1)
+    ee = torch.zeros(ei_undirected_user_pro.shape[0],768).to(device)
+
+    data = Data(x=comb_embedding, ei=ei_undirected_user_pro_per.long(), edge_attr= (ee),y= (labels))
+
+    l1 = [i for i in range(num_persona, ue.shape[0] + num_persona)]
+    train_mask = torch.tensor(l1, dtype=torch.long).to(device)
+
+    train_loader = NeighborSampler(ei_undirected_user_pro,sizes=[-1],node_idx=train_mask,batch_size=user,shuffle=False,num_workers=1)
+
+# ================= TRAIN LOOP =================
+    total_loss=[]
+    hamming_loss_history={str(p): [] for p in prefix_sizes}
+    acc_history = {str(p): [] for p in prefix_sizes}
+    f1_history  = {str(p): [] for p in prefix_sizes}
+    jaccard_history={str(p): [] for p in prefix_sizes}
+   
+    pers = num_persona
+    user = ue.shape[0]
+    previous_predictions = None
+
+    with torch.no_grad():
+    
+        k = 0
+        y_true_all = []
+        y_pred_all = {str(p): [] for p in prefix_sizes}
+        epoch_predictions = {str(p): [] for p in prefix_sizes}
+            
+        for batch in enumerate(train_loader):
+            k+=1
+            b              = batch[0]
+            
+            users   = batch[1][1][:user] 
+            product = batch[1][1][user:]
+            edge_ind = batch[1][2][0]
+            edge_emb_index = batch[1][2][1]
+    
+            batch_user_emb = comb_embedding[users].to(device)
+            batch_prod_emb = comb_embedding[product].to(device)
+            edge_features = torch.zeros(edge_ind.shape[1], 768).to(device)
+    
+            l2 = product.to(device)
+            train_mask1 = l2.long().to(device)
+            train_loader_persona = NeighborSampler(ei_per2pro, [-1], node_idx=train_mask1,batch_size = pe.shape[0], shuffle=False)#neighbour sampler
+            data_iter_persona = iter(train_loader_persona)           
+           
+            
+            persona = next(iter(train_loader_persona))
+            persona_node = persona[1][-num_persona:].to(device)
+            persona_neighbours = persona[1][:-num_persona].to(device)
+            persona_prod_edge_ind = swap_rows(persona[2][0]).to(device)
+            persona_embeddings = comb_embedding[persona_node].to(device)
+    
+            torch.nn.init.xavier_uniform_(persona_embeddings)
+    
+            batched_states = (batch_user_emb,edge_ind.to(device),edge_features,batch_prod_emb,persona_embeddings,persona_prod_edge_ind)
+    
+            # optimizer.zero_grad()
+    
+            # ── 1. Forward (TriPer_B) ─────────────
+            predictions_dict, z_u_B, z_prod_B, z_c_B = model(batched_states)
+            # print("After triper_B Z_u shape=",z_u_B.shape)
+    
+            # ── 2. Labels (already permuted) ──────
+            permuted_labels = permute_labels(labels.to(device), persona_node.to(device))
+            labels_ = permuted_labels.reshape(-1,persona_embeddings.shape[0]*batch_user_emb.shape[0])
+            labels_     = (labels_).squeeze().to(device)
+           
+            y_true_all.append(labels_.detach().cpu().numpy())
+            for p in prefix_sizes:
+                pred_p = predictions_dict[str(p)].squeeze()
+                # bce_loss += criterion(pred_p, labels_)
+                # bce_loss.append(criterion(pred_p, labels_))
+                # predictions = pred_p.detach().view(user, num_persona)
+                epoch_predictions[str(p)].append(pred_p.detach().cpu())
+                predictions_rounded = pred_p.detach().round().cpu().numpy()
+                y_pred_all[str(p)].append(predictions_rounded)        
+            
+        current_predictions = {}
+
+        for p in prefix_sizes:
+            current_predictions[str(p)] = torch.cat(epoch_predictions[str(p)],dim=0).view(user, num_persona).to(device)
+
+    # This becomes the source for NEXT epoch
+        previous_predictions = current_predictions
+        y_true_all = np.concatenate(y_true_all, axis=0)
+        # y_true_all = y_true_all.reshape(-1, num_persona)
+    
+        for p in prefix_sizes:
+            y_pred_all[str(p)] = np.concatenate(y_pred_all[str(p)], axis=0)
+            # y_pred_all[str(p)] = y_pred_all[str(p)].reshape(-1, num_persona)
+            # print(f"\n--- Prefix Size: {p} ---")
+            # if type == 'single':
+            accuracy = accuracy_score(y_true_all, y_pred_all[str(p)])
+            f1 = f1_score(y_true_all, y_pred_all[str(p)], average='weighted') 
+            hamming_loss_ = hamming_loss(y_true_all, y_pred_all[str(p)])
+            jaccard=jaccard_score(y_true_all, y_pred_all[str(p)], average='weighted')
+
+            acc_history[str(p)].append(accuracy)
+            f1_history[str(p)].append(f1)
+            hamming_loss_history[str(p)].append(hamming_loss_)
+            jaccard_history[str(p)].append(jaccard)
+          
+
+    return model,acc_history,f1_history,hamming_loss_history,jaccard_history
