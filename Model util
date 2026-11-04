@@ -1,0 +1,37 @@
+class PreNormException(Exception):
+    pass
+
+class BaseModel(torch.nn.Module):
+    def initialize_parameters(self):
+        for l in self.modules():
+            if isinstance(l, torch.nn.Linear):
+                self.initializer(l.weight.data)
+                if l.bias is not None:
+                    torch.nn.init.constant_(l.bias.data, 0)
+
+    def pre_train_init(self):
+        for module in self.modules():
+            if isinstance(module, PreNormLayer):
+                module.start_updates()
+
+    def pre_train(self, state):
+        with torch.no_grad():
+            try:
+                self.forward(state)
+                return False
+            except PreNormException:
+                return True
+
+    def pre_train_next(self):
+        for module in self.modules():
+            if isinstance(module, PreNormLayer) \
+                    and module.waiting_updates and module.received_updates:
+                module.stop_updates()
+                return module
+        return None
+
+    def save_state(self, filepath):
+        torch.save(self.state_dict(), filepath)
+
+    def restore_state(self, filepath):
+        self.load_state_dict(torch.load(filepath, map_location=torch.device('cpu')))
